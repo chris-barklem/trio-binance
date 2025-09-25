@@ -119,5 +119,3 @@ If you prefer secure default behavior, I can change the tests to make SSL verifi
 This project forks work from `sammchardy/python-binance` and preserves the original license and credits. See the upstream repository for full attribution.
 
 ---
-
-If you want the README tailored further (more examples, publish instructions, or a one-page API reference), tell me what to add and I’ll update it.
