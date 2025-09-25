@@ -1,23 +1,23 @@
-import asyncio
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlencode, quote
 import time
-import aiohttp
+import httpx
 import yarl
 
-from binance.enums import HistoricalKlinesType
-from binance.exceptions import (
+from trio_binance.enums import HistoricalKlinesType
+from trio_binance.exceptions import (
     BinanceAPIException,
     BinanceRequestException,
     NotImplementedException,
 )
-from binance.helpers import (
+from trio_binance.helpers import (
     convert_list_to_json_array,
     convert_ts_str,
     get_loop,
     interval_to_milliseconds,
 )
+from trio_binance.trio_helpers import sleep as trio_sleep
 from .base_client import BaseClient
 from .client import Client
 
@@ -99,16 +99,31 @@ class AsyncClient(BaseClient):
             await self.close_connection()
             raise
 
-    def _init_session(self) -> aiohttp.ClientSession:
-        session = aiohttp.ClientSession(
-            loop=self.loop, headers=self._get_headers(), **self._session_params
-        )
+    def _init_session(self) -> httpx.AsyncClient:
+        # Use httpx.AsyncClient which is compatible with AnyIO/Trio when run
+        # under a Trio backend. Keep headers and session params.
+        timeout = self._session_params.pop("timeout", None)
+        if timeout is None:
+            timeout = httpx.Timeout(10.0)
+        session_kwargs = dict(headers=self._get_headers(), timeout=timeout, **self._session_params)
+        if getattr(self, "https_proxy", None):
+            # httpx expects a dictionary mapping scheme->proxy URL or a single URL
+            session_kwargs["proxies"] = {
+                "http": self.https_proxy,
+                "https": self.https_proxy,
+            }
+        session = httpx.AsyncClient(**session_kwargs)
         return session
 
     async def close_connection(self):
         if self.session:
             assert self.session
-            await self.session.close()
+            # httpx.AsyncClient exposes `aclose()` for async close
+            try:
+                await self.session.aclose()
+            except AttributeError:
+                # fallback in case a different session implementation is used
+                await self.session.close()
         if self.ws_api:
             await self.ws_api.close()
             self._ws_api = None
@@ -151,33 +166,39 @@ class AsyncClient(BaseClient):
             url_encoded_data = urlencode(dict_data)
             data = f"{url_encoded_data}&signature={signature}"
 
-        async with getattr(self.session, method)(
-            yarl.URL(uri, encoded=True),
-            proxy=self.https_proxy,
-            headers=headers,
-            data=data,
-            **kwargs,
-        ) as response:
-            self.response = response
-            return await self._handle_response(response)
+        # httpx expects method names like 'get', 'post' etc. We call the
+        # corresponding coroutine on the AsyncClient and await the response.
+        func = getattr(self.session, method)
+        call_kwargs = {
+            "url": str(yarl.URL(uri, encoded=True)),
+            "headers": headers,
+        }
+        call_kwargs.update(kwargs)
+        # Do not pass body/data to GET requests (httpx will raise TypeError)
+        if method.lower() != "get" and data is not None:
+            call_kwargs["data"] = data
 
-    async def _handle_response(self, response: aiohttp.ClientResponse):
+        response = await func(**call_kwargs)
+        self.response = response
+        return await self._handle_response(response)
+
+    async def _handle_response(self, response: httpx.Response):
         """Internal helper for handling API responses from the Binance server.
         Raises the appropriate exceptions when necessary; otherwise, returns the
         response.
         """
-        if not str(response.status).startswith("2"):
-            raise BinanceAPIException(response, response.status, await response.text())
-        
-        text = await response.text()
+        status = response.status_code
+        if not (200 <= status < 300):
+            raise BinanceAPIException(response, status, await response.aread())
+
+        text = response.text
         if text == "":
             return {}
 
         try:
-            return await response.json()
+            return response.json()
         except ValueError:
-            txt = await response.text()
-            raise BinanceRequestException(f"Invalid Response: {txt}")
+            raise BinanceRequestException(f"Invalid Response: {text}")
 
     async def _request_api(
         self,
@@ -561,7 +582,7 @@ class AsyncClient(BaseClient):
             # sleep after every 3rd call to be kind to the API
             idx += 1
             if idx % 3 == 0:
-                await asyncio.sleep(1)
+                await trio_sleep(1)
 
         return output_data
 
@@ -649,7 +670,7 @@ class AsyncClient(BaseClient):
             # sleep after every 3rd call to be kind to the API
             idx += 1
             if idx % 3 == 0:
-                await asyncio.sleep(1)
+                await trio_sleep(1)
 
     _historical_klines_generator.__doc__ = Client._historical_klines_generator.__doc__
 

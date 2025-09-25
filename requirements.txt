@@ -1,0 +1,29 @@
+# Runtime dependencies
+httpx[http2]
+trio
+anyio
+yarl
+pytz
+dateparser
+cryptography
+pycryptodome
+websockets
+requests
+
+# Dev/test dependencies
+pytest
+pytest-trio
+httpx[http2]
+trio
+anyio
+yarl
+pytz
+dateparser
+cryptography
+pycryptodome
+websockets
+requests
+
+# Dev / test
+pytest
+pytest-trio

@@ -1,10 +1,11 @@
 import logging
 from operator import itemgetter
-import asyncio
+import trio
 import time
 from typing import Optional, Dict, Callable
 
 from ..helpers import get_loop
+from trio_binance.trio_helpers import wait_for, schedule_task, sleep as trio_sleep
 from .streams import BinanceSocketManager
 from .threaded_stream import ThreadedApiManager
 
@@ -180,7 +181,9 @@ class BaseDepthCacheManager:
         self._log = logging.getLogger(__name__)
 
     async def __aenter__(self):
-        await asyncio.gather(self._init_cache(), self._start_socket())
+        # Initialise cache and start socket (sequentially under Trio).
+        await self._init_cache()
+        await self._start_socket()
         await self._socket.__aenter__()
         return self
 
@@ -192,7 +195,7 @@ class BaseDepthCacheManager:
         dc = None
         while not dc:
             try:
-                res = await asyncio.wait_for(self._socket.recv(), timeout=self.TIMEOUT)
+                res = await wait_for(self._socket.recv(), timeout=self.TIMEOUT)
                 self._log.debug(f"Received message: {res}")
             except Exception as e:
                 self._log.warning(f"Exception recieving message: {e.__class__.__name__} (e) ")
@@ -473,9 +476,14 @@ class ThreadedDepthCacheManager(ThreadedApiManager):
         )
         path = symbol.lower() + "@depth" + str(limit)
         self._socket_running[path] = True
-        self._loop.call_soon(
-            asyncio.create_task, self.start_listener(dcm, path, callback)
-        )
+        # Schedule the listener on the detected backend
+        try:
+            if self._loop:
+                self._loop.call_soon(self._loop.create_task, self.start_listener(dcm, path, callback))
+            else:
+                schedule_task(self.start_listener(dcm, path, callback))
+        except Exception:
+            schedule_task(self.start_listener(dcm, path, callback))
         return path
 
     def start_depth_cache(

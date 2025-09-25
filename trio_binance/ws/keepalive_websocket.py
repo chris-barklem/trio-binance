@@ -1,7 +1,7 @@
-import asyncio
-from binance.async_client import AsyncClient
-from binance.ws.reconnecting_websocket import ReconnectingWebsocket
-from binance.ws.constants import KEEPALIVE_TIMEOUT
+from trio_binance.async_client import AsyncClient
+from trio_binance.ws.reconnecting_websocket import ReconnectingWebsocket
+from trio_binance.ws.constants import KEEPALIVE_TIMEOUT
+from trio_binance.trio_helpers import schedule_task
 
 
 class KeepAliveWebsocket(ReconnectingWebsocket):
@@ -53,9 +53,26 @@ class KeepAliveWebsocket(ReconnectingWebsocket):
         self._start_socket_timer()
 
     def _start_socket_timer(self):
-        self._timer = self._loop.call_later(
-            self._user_timeout, lambda: asyncio.create_task(self._keepalive_socket())
-        )
+        # Schedule the keepalive coroutine to run after `_user_timeout`.
+        # We avoid relying directly on loop.call_later to keep compatibility
+        # during migration; schedule_task will pick an appropriate backend.
+        def _runner():
+            schedule_task(self._keepalive_socket())
+
+        try:
+            if self._loop:
+                self._timer = self._loop.call_later(self._user_timeout, _runner)
+            else:
+                # no event loop available — spawn a background task that sleeps
+                schedule_task(self._delayed_keepalive())
+        except Exception:
+            schedule_task(self._delayed_keepalive())
+
+    async def _delayed_keepalive(self):
+        import trio
+
+        await trio.sleep(self._user_timeout)
+        await self._keepalive_socket()
 
     async def _get_listen_key(self):
         if self._keepalive_type == "user":

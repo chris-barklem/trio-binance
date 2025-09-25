@@ -1,18 +1,19 @@
-import asyncio
+import trio
 import time
 from enum import Enum
 from typing import Optional, List, Dict, Callable, Any
 
-from binance.ws.constants import KEEPALIVE_TIMEOUT
-from binance.ws.keepalive_websocket import KeepAliveWebsocket
-from binance.ws.reconnecting_websocket import ReconnectingWebsocket
-from binance.ws.threaded_stream import ThreadedApiManager
+
+from trio_binance.ws.constants import KEEPALIVE_TIMEOUT
+from trio_binance.ws.keepalive_websocket import KeepAliveWebsocket
+from trio_binance.ws.reconnecting_websocket import ReconnectingWebsocket
+from trio_binance.ws.threaded_stream import ThreadedApiManager
 
 
-from binance.async_client import AsyncClient
-from binance.enums import FuturesType
-from binance.enums import ContractType
-from binance.helpers import get_loop
+from trio_binance.async_client import AsyncClient
+from trio_binance.enums import FuturesType
+from trio_binance.enums import ContractType
+from trio_binance.helpers import get_loop
 
 
 class BinanceSocketType(str, Enum):
@@ -56,7 +57,7 @@ class BinanceSocketManager:
         self.OPTIONS_URL = self.OPTIONS_URL.format(client.tld)
 
         self._conns = {}
-        self._loop = get_loop()
+        self._loop = None
         self._client = client
         self._user_timeout = user_timeout
         self.testnet = self._client.testnet
@@ -1209,7 +1210,7 @@ class ThreadedWebsocketManager(ThreadedApiManager):
         testnet: bool = False,
         session_params: Optional[Dict[str, Any]] = None,
         https_proxy: Optional[str] = None,
-        loop: Optional[asyncio.AbstractEventLoop] = None,
+    loop: Optional[object] = None,
         max_queue_size: int = 100,
     ):
         super().__init__(
@@ -1247,9 +1248,10 @@ class ThreadedWebsocketManager(ThreadedApiManager):
         socket = getattr(self._bsm, socket_name)(**params)
         socket_path: str = path or socket._path  # noqa
         self._socket_running[socket_path] = True
-        self._loop.call_soon_threadsafe(
-            asyncio.create_task, self.start_listener(socket, socket_path, callback)
-        )
+        # Schedule the listener using Trio-friendly helpers
+        from trio_binance.trio_helpers import schedule_task
+
+        schedule_task(self.start_listener(socket, socket_path, callback))
         return socket_path
 
     def start_depth_socket(

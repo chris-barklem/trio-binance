@@ -3,7 +3,7 @@ from pathlib import Path
 import random
 from typing import Dict, Optional, List, Tuple, Union, Any
 
-import asyncio
+import trio
 import hashlib
 import hmac
 import time
@@ -14,7 +14,7 @@ import urllib.parse as _urlencode
 from operator import itemgetter
 from urllib.parse import urlencode
 
-from binance.ws.websocket_api import WebsocketAPI
+from trio_binance.ws.websocket_api import WebsocketAPI
 
 from .helpers import get_loop
 
@@ -159,7 +159,7 @@ class BaseClient:
         testnet: bool = False,
         private_key: Optional[Union[str, Path]] = None,
         private_key_pass: Optional[str] = None,
-        loop: Optional[asyncio.AbstractEventLoop] = None,
+    loop: Optional[object] = None,
         time_unit: Optional[str] = None,
     ):
         """Binance API Client constructor
@@ -385,13 +385,12 @@ class BaseClient:
         return await self.ws_future.request(id, payload)
 
     def _ws_futures_api_request_sync(self, method: str, signed: bool, params: dict):
-        self.loop = get_loop()
-        return self.loop.run_until_complete(
-            self._ws_futures_api_request(method, signed, params)
-        )
+        # Synchronous wrapper using Trio
+        return trio.run(lambda: self._ws_futures_api_request(method, signed, params))
 
     async def _make_sync(self, method):
-        return asyncio.run(method)
+        # Run the provided coroutine under Trio from async context via to_thread
+        return await trio.to_thread.run_sync(lambda: trio.run(lambda: method))
 
     async def _ws_api_request(self, method: str, signed: bool, params: dict):
         """Send request and wait for response"""
@@ -409,10 +408,7 @@ class BaseClient:
 
     def _ws_api_request_sync(self, method: str, signed: bool, params: dict):
         """Send request to WS API and wait for response"""
-        self.loop = get_loop()
-        return self.loop.run_until_complete(
-            self._ws_api_request(method, signed, params)
-        )
+        return trio.run(lambda: self._ws_api_request(method, signed, params))
 
     @staticmethod
     def _get_version(version: int, **kwargs) -> int:

@@ -31,7 +31,7 @@ var/
 
 # Pycached
 __pycache__/
-*.pyc
+*.pyc*
 
 # Installer logs
 pip-log.txt

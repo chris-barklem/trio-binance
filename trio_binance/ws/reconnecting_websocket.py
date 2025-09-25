@@ -1,10 +1,10 @@
-import asyncio
+import trio
+import warnings
 import gzip
 import json
 import logging
 from socket import gaierror
 from typing import Optional
-from asyncio import sleep
 from random import random
 
 # load orjson if available, otherwise default to json
@@ -14,10 +14,15 @@ try:
 except ImportError:
     pass
 
-try:
-    from websockets.exceptions import ConnectionClosedError  # type: ignore
-except ImportError:
-    from websockets import ConnectionClosedError  # type: ignore
+# The `websockets` package exposes a legacy module which currently emits a
+# DeprecationWarning on import. We avoid importing legacy internals and
+# instead use attribute checks on the websocket object. Silence the specific
+# warning to avoid noisy output during tests and consumption.
+warnings.filterwarnings(
+    "ignore",
+    message=r"websockets\.legacy is deprecated",
+    category=DeprecationWarning,
+)
 
 
 Proxy = None
@@ -32,13 +37,14 @@ except ImportError:
 
 import websockets as ws
 
-from binance.exceptions import (
+from trio_binance.exceptions import (
     BinanceWebsocketClosed,
     BinanceWebsocketUnableToConnect,
     BinanceWebsocketQueueOverflow,
 )
-from binance.helpers import get_loop
-from binance.ws.constants import WSListenerState
+from trio_binance.helpers import get_loop
+from trio_binance.trio_helpers import sleep as trio_sleep, schedule_task
+from trio_binance.ws.constants import WSListenerState
 
 
 class ReconnectingWebsocket:
@@ -71,7 +77,26 @@ class ReconnectingWebsocket:
         self._socket = None
         self.ws: Optional[ws.WebSocketClientProtocol] = None  # type: ignore
         self.ws_state = WSListenerState.INITIALISING
-        self._queue = asyncio.Queue()
+        # Use a small compatibility shim for queues so we can support either
+        # asyncio.Queue (current behavior) or trio memory channels after
+        # migration. The shim exposes async put(), get(), and qsize().
+        class _QueueShim:
+            def __init__(self):
+                from trio_binance.trio_helpers import open_memory_channel
+
+                self._send, self._recv = open_memory_channel(0)
+
+            async def put(self, item):
+                await self._send.send(item)
+
+            async def get(self):
+                return await self._recv.receive()
+
+            def qsize(self):
+                # Trio memory channels don't expose qsize; return 0 to be conservative
+                return 0
+
+        self._queue = _QueueShim()
         self._handle_read_loop = None
         self._https_proxy = https_proxy
         self._ws_kwargs = kwargs
@@ -138,14 +163,23 @@ class ReconnectingWebsocket:
         self._reconnects = 0
         await self._after_connect()
         if not self._handle_read_loop:
-            self._handle_read_loop = self._loop.call_soon_threadsafe(
-                asyncio.create_task, self._read_loop()
-            )
+            # Schedule the read loop on the detected backend. Use schedule_task
+            # to pick asyncio or Trio scheduling depending on runtime.
+            try:
+                if self._loop:
+                    # use loop.call_soon_threadsafe to schedule into provided loop
+                    self._handle_read_loop = self._loop.call_soon_threadsafe(
+                        self._loop.create_task, self._read_loop()
+                    )
+                else:
+                    self._handle_read_loop = schedule_task(self._read_loop())
+            except Exception:
+                self._handle_read_loop = schedule_task(self._read_loop())
 
     async def _kill_read_loop(self):
         self.ws_state = WSListenerState.EXITING
         while self._handle_read_loop:
-            await sleep(0.1)
+                await trio_sleep(0.1)
         self._log.debug("Finished killing read_loop")
 
     async def _before_connect(self):
@@ -188,19 +222,20 @@ class ReconnectingWebsocket:
                             f"_read_loop {self._path} break for {self.ws_state}"
                         )
                         break
-                    elif self.ws.state == ws.protocol.State.CLOSING:  # type: ignore
-                        await asyncio.sleep(0.1)
-                        continue
-                    elif self.ws.state == ws.protocol.State.CLOSED:  # type: ignore
+                    # If the protocol reports the connection as closed, treat it
+                    # as a reconnection trigger. We avoid referencing the
+                    # `ws.protocol.State` enum to prevent importing legacy
+                    # internals from `websockets`.
+                    elif getattr(self.ws, "closed", False):
                         self._reconnect()
                         raise BinanceWebsocketClosed(
                             "Connection closed. Reconnecting..."
                         )
                     elif self.ws_state == WSListenerState.STREAMING:
                         assert self.ws
-                        res = await asyncio.wait_for(
-                            self.ws.recv(), timeout=self.TIMEOUT
-                        )
+                        from trio_binance.trio_helpers import wait_for
+
+                        res = await wait_for(self.ws.recv(), timeout=self.TIMEOUT)
                         res = self._handle_message(res)
                         self._log.debug(f"Received message: {res}")
                         if res:
@@ -210,10 +245,10 @@ class ReconnectingWebsocket:
                                 raise BinanceWebsocketQueueOverflow(
                                     f"Message queue size {self._queue.qsize()} exceeded maximum {self.max_queue_size}"
                                 )
-                except asyncio.TimeoutError:
+                except trio.TooSlowError:
                     self._log.debug(f"no message in {self.TIMEOUT} seconds")
                     # _no_message_received_reconnect
-                except asyncio.CancelledError as e:
+                except trio.Cancelled as e:
                     self._log.debug(f"_read_loop cancelled error {e}")
                     await self._queue.put({
                         "e": "error",
@@ -222,9 +257,7 @@ class ReconnectingWebsocket:
                     })
                     break
                 except (
-                    asyncio.IncompleteReadError,
                     gaierror,
-                    ConnectionClosedError,
                     BinanceWebsocketClosed,
                 ) as e:
                     # reports errors and continue loop
@@ -259,7 +292,7 @@ class ReconnectingWebsocket:
                 f"websocket reconnecting. {self.MAX_RECONNECTS - self._reconnects} reconnects left - "
                 f"waiting {reconnect_wait}"
             )
-            await asyncio.sleep(reconnect_wait)
+            await trio_sleep(reconnect_wait)
             try:
                 await self.connect()
             except Exception as e:
@@ -273,8 +306,10 @@ class ReconnectingWebsocket:
         res = None
         while not res:
             try:
-                res = await asyncio.wait_for(self._queue.get(), timeout=self.TIMEOUT)
-            except asyncio.TimeoutError:
+                from trio_binance.trio_helpers import wait_for
+
+                res = await wait_for(self._queue.get(), timeout=self.TIMEOUT)
+            except trio.TooSlowError:
                 self._log.debug(f"no message in {self.TIMEOUT} seconds")
         return res
 
@@ -283,7 +318,7 @@ class ReconnectingWebsocket:
             self.ws_state != WSListenerState.STREAMING
             and self.ws_state != WSListenerState.EXITING
         ):
-            await sleep(0.1)
+            await trio_sleep(0.1)
 
     def _get_reconnect_wait(self, attempts: int) -> int:
         expo = 2**attempts

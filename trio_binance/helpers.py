@@ -1,4 +1,3 @@
-import asyncio
 from decimal import Decimal
 import json
 from typing import Union, Optional, Dict
@@ -8,7 +7,7 @@ import pytz
 
 from datetime import datetime, timezone
 
-from binance.exceptions import UnknownDateFormat
+from trio_binance.exceptions import UnknownDateFormat
 
 
 def date_to_milliseconds(date_str: str) -> int:
@@ -92,13 +91,14 @@ def get_loop():
     """check if there is an event loop in the current thread, if not create one
     inspired by https://stackoverflow.com/questions/46727787/runtimeerror-there-is-no-current-event-loop-in-thread-in-async-apscheduler
     """
-    try:
-        loop = asyncio.get_event_loop()
-        return loop
-    except RuntimeError as e:
-        if str(e).startswith("There is no current event loop in thread"):
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            return loop
-        else:
-            raise
+    # During migration to Trio we avoid creating or returning an
+    # asyncio event loop. Existing call sites in the repository use
+    # `get_loop()` primarily to obtain a loop for running short-lived
+    # coroutines from synchronous code. We'll keep returning the
+    # currently configured asyncio loop if present, otherwise return None.
+    #
+    # Long-term we will remove usages of this helper and replace them with
+    # Trio-native patterns (nurseries, run_sync_in_worker_thread, etc.).
+    # In a Trio-only runtime we no longer create or return an asyncio loop.
+    # Return None to indicate no asyncio loop is available.
+    return None

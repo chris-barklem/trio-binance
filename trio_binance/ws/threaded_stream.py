@@ -1,10 +1,13 @@
-import asyncio
+import trio
+import inspect
 import logging
 import threading
 from typing import Optional, Dict, Any
 
-from binance.async_client import AsyncClient
-from binance.helpers import get_loop
+from trio_binance.async_client import AsyncClient
+from trio_binance.helpers import get_loop
+from trio_binance.trio_helpers import schedule_task, sleep as trio_sleep
+from trio_binance.ws.trio_stream import TrioApiManager
 
 
 class ThreadedApiManager(threading.Thread):
@@ -17,11 +20,11 @@ class ThreadedApiManager(threading.Thread):
         testnet: bool = False,
         session_params: Optional[Dict[str, Any]] = None,
         https_proxy: Optional[str] = None,
-        _loop: Optional[asyncio.AbstractEventLoop] = None,
+        _loop: Optional[object] = None,
     ):
         """Initialise the BinanceSocketManager"""
         super().__init__()
-        self._loop: asyncio.AbstractEventLoop = get_loop() if _loop is None else _loop
+        self._loop: Optional[object] = get_loop() if _loop is None else _loop
         self._client: Optional[AsyncClient] = None
         self._running: bool = True
         self._socket_running: Dict[str, bool] = {}
@@ -46,17 +49,19 @@ class ThreadedApiManager(threading.Thread):
             self._log.error(f"Failed to create client: {e}")
             self.stop()
         while self._running:
-            await asyncio.sleep(0.2)
+            await trio_sleep(0.2)
         while self._socket_running:
-            await asyncio.sleep(0.2)
+            await trio_sleep(0.2)
         self._log.info("Socket listener stopped")
 
     async def start_listener(self, socket, path: str, callback):
         async with socket as s:
             while self._socket_running[path]:
                 try:
-                    msg = await asyncio.wait_for(s.recv(), 3)
-                except asyncio.TimeoutError:
+                    from trio_binance.trio_helpers import wait_for
+
+                    msg = await wait_for(s.recv(), timeout=3)
+                except trio.TooSlowError:
                     ...
                     continue
                 except Exception as e:
@@ -68,14 +73,15 @@ class ThreadedApiManager(threading.Thread):
                     }
                 if not msg:
                     continue  # Handle both async and sync callbacks
-                if asyncio.iscoroutinefunction(callback):
-                    asyncio.create_task(callback(msg))
+                if inspect.iscoroutinefunction(callback):
+                    schedule_task(callback(msg))
                 else:
                     callback(msg)
         del self._socket_running[path]
 
     def run(self):
-        self._loop.run_until_complete(self.socket_listener())
+        # Run the listener using Trio in this thread
+        trio.run(self.socket_listener)
 
     def stop_socket(self, socket_name):
         if socket_name in self._socket_running:
@@ -91,14 +97,21 @@ class ThreadedApiManager(threading.Thread):
         if not self._running:
             return
         self._running = False
-        if self._client and self._loop and not self._loop.is_closed():
+        if self._client:
             try:
-                future = asyncio.run_coroutine_threadsafe(
-                    self.stop_client(), self._loop
-                )
-                future.result(timeout=5)  # Add timeout to prevent hanging
+                trio.run(self.stop_client)
             except Exception as e:
-                # Log the error but don't raise it
                 self._log.error(f"Error stopping client: {e}")
         for socket_name in self._socket_running.keys():
             self._socket_running[socket_name] = False
+
+
+def get_api_manager(use_trio: bool = False, *args, **kwargs):
+    """Factory returning a ThreadedApiManager or TrioApiManager.
+
+    - If use_trio is True, returns a new `TrioApiManager` instance.
+    - Otherwise returns a `ThreadedApiManager`.
+    """
+    if use_trio:
+        return TrioApiManager(*args, **kwargs)
+    return ThreadedApiManager(*args, **kwargs)
