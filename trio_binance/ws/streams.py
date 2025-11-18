@@ -22,6 +22,7 @@ class BinanceSocketType(str, Enum):
     COIN_M_FUTURES = "Coin_M_Futures"
     OPTIONS = "Vanilla_Options"
     ACCOUNT = "Account"
+    SBE = "SBE"
 
 
 class BinanceSocketManager:
@@ -32,6 +33,7 @@ class BinanceSocketManager:
     DSTREAM_URL = "wss://dstream.binance.{}/"
     DSTREAM_TESTNET_URL = "wss://dstream.binancefuture.com/"
     OPTIONS_URL = "wss://nbstream.binance.{}/eoptions/"
+    SBE_URL = "wss://stream-sbe.binance.com/"
 
     WEBSOCKET_DEPTH_5 = "5"
     WEBSOCKET_DEPTH_10 = "10"
@@ -78,6 +80,7 @@ class BinanceSocketManager:
         stream_url: Optional[str] = None,
         prefix: str = "ws/",
         is_binary: bool = False,
+        message_decoder=None,
         socket_type: BinanceSocketType = BinanceSocketType.SPOT,
     ) -> ReconnectingWebsocket:
         conn_id = f"{socket_type}_{path}"
@@ -91,6 +94,7 @@ class BinanceSocketManager:
                 prefix=prefix,
                 exit_coro=lambda p: self._exit_socket(f"{socket_type}_{p}"),
                 is_binary=is_binary,
+                message_decoder=message_decoder,
                 https_proxy=self._client.https_proxy,
                 max_queue_size=self._max_queue_size,
                 **self.ws_kwargs,
@@ -869,6 +873,27 @@ class BinanceSocketManager:
         stream_name = "/".join([s for s in streams])
         stream_path = f"streams={stream_name}"
         return self._get_options_socket(stream_path, prefix="stream?")
+
+    def sbe_multiplex_socket(self, streams: List[str]):
+        path = f"streams={'/'.join(streams)}"
+        return self._get_socket(
+            path,
+            stream_url=self.SBE_URL,
+            prefix="stream?",
+            is_binary=True,
+            message_decoder=lambda b: b,
+            socket_type=BinanceSocketType.SBE,
+        )
+
+    def sbe_socket(self, stream: str):
+        return self._get_socket(
+            stream,
+            stream_url=self.SBE_URL,
+            prefix="ws/",
+            is_binary=True,
+            message_decoder=lambda b: b,
+            socket_type=BinanceSocketType.SBE,
+        )
 
     def futures_multiplex_socket(
         self, streams: List[str], futures_type: FuturesType = FuturesType.USD_M

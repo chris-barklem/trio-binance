@@ -62,7 +62,6 @@ class WebsocketAPI(ReconnectingWebsocket):
             async with self._connection_lock:
                 if (
                     self.ws is None
-                    or getattr(self.ws, "closed", True)
                     or self.ws_state != WSListenerState.STREAMING
                 ):
                     if not self._connecting:
@@ -84,7 +83,7 @@ class WebsocketAPI(ReconnectingWebsocket):
                     self._log.info("Connection is reconnecting, waiting...")
                     await self._wait_for_reconnect()
 
-                elif self.ws is None or getattr(self.ws, "closed", True):
+                elif self.ws is None:
                     self._log.info("Connection lost, reconnecting...")
                     # attempt to connect only if no-one else is doing it
                     do_connect = False
@@ -133,7 +132,7 @@ class WebsocketAPI(ReconnectingWebsocket):
                 raise BinanceWebsocketUnableToConnect(
                     "Trying to send request while WebSocket is not connected"
                 )
-            await self.ws.send(self.json_dumps(payload))
+            await self.ws.send_message(self.json_dumps(payload))
 
             # Wait for response (TrioFuture.wait will be awaited by Trio migration)
             # We still call asyncio.wait_for here to preserve timeout semantics

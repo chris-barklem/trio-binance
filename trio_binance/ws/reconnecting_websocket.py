@@ -1,4 +1,5 @@
 import trio
+import time
 import warnings
 import gzip
 import json
@@ -35,7 +36,7 @@ try:
 except ImportError:
     pass
 
-import websockets as ws
+from trio_websocket import open_websocket_url, ConnectionClosed
 
 from trio_binance.exceptions import (
     BinanceWebsocketClosed,
@@ -60,6 +61,7 @@ class ReconnectingWebsocket:
         path: Optional[str] = None,
         prefix: str = "ws/",
         is_binary: bool = False,
+        message_decoder=None,
         exit_coro=None,
         https_proxy: Optional[str] = None,
         max_queue_size: int = 100,
@@ -73,10 +75,12 @@ class ReconnectingWebsocket:
         self._prefix = prefix
         self._reconnects = 0
         self._is_binary = is_binary
+        self._message_decoder = message_decoder
         self._conn = None
         self._socket = None
-        self.ws: Optional[ws.WebSocketClientProtocol] = None  # type: ignore
+        self.ws = None
         self.ws_state = WSListenerState.INITIALISING
+        self._last_message_time = 0.0
         # Use a small compatibility shim for queues so we can support either
         # asyncio.Queue (current behavior) or trio memory channels after
         # migration. The shim exposes async put(), get(), and qsize().
@@ -126,8 +130,8 @@ class ReconnectingWebsocket:
         if self._exit_coro:
             await self._exit_coro(self._path)
         if self.ws:
-            await self.ws.close()
-        if self._conn and hasattr(self._conn, "protocol"):
+            await self.ws.aclose()
+        if self._conn:
             await self._conn.__aexit__(exc_type, exc_val, exc_tb)
         self.ws = None
 
@@ -140,18 +144,11 @@ class ReconnectingWebsocket:
             f"{self._url}{getattr(self, '_prefix', '')}{getattr(self, '_path', '')}"
         )
 
-        # handle https_proxy
-        if self._https_proxy:
-            if not Proxy or not proxy_connect:
-                raise ImportError(
-                    "websockets_proxy is not installed, please install it to use a websockets proxy (pip install websockets_proxy)"
-                )
-            proxy = Proxy.from_url(self._https_proxy)  # type: ignore
-            self._conn = proxy_connect(
-                ws_url, close_timeout=0.1, proxy=proxy, **self._ws_kwargs
-            )  # type: ignore
-        else:
-            self._conn = ws.connect(ws_url, close_timeout=0.1, **self._ws_kwargs)  # type: ignore
+        extra = self._ws_kwargs.get("extra_headers")
+        if isinstance(extra, dict):
+            self._ws_kwargs["extra_headers"] = list(extra.items())
+        # trio_websocket connection
+        self._conn = open_websocket_url(ws_url, **self._ws_kwargs)
 
         try:
             self.ws = await self._conn.__aenter__()
@@ -161,6 +158,7 @@ class ReconnectingWebsocket:
             raise e
         self.ws_state = WSListenerState.STREAMING
         self._reconnects = 0
+        self._last_message_time = time.time()
         await self._after_connect()
         if not self._handle_read_loop:
             # Schedule the read loop on the detected backend. Use schedule_task
@@ -189,6 +187,8 @@ class ReconnectingWebsocket:
         pass
 
     def _handle_message(self, evt):
+        if self._message_decoder:
+            return self._message_decoder(evt)
         if self._is_binary:
             try:
                 evt = gzip.decompress(evt)
@@ -222,20 +222,15 @@ class ReconnectingWebsocket:
                             f"_read_loop {self._path} break for {self.ws_state}"
                         )
                         break
-                    # If the protocol reports the connection as closed, treat it
-                    # as a reconnection trigger. We avoid referencing the
-                    # `ws.protocol.State` enum to prevent importing legacy
-                    # internals from `websockets`.
-                    elif getattr(self.ws, "closed", False):
-                        self._reconnect()
-                        raise BinanceWebsocketClosed(
-                            "Connection closed. Reconnecting..."
-                        )
                     elif self.ws_state == WSListenerState.STREAMING:
                         assert self.ws
                         from trio_binance.trio_helpers import wait_for
 
-                        res = await wait_for(self.ws.recv(), timeout=self.TIMEOUT)
+                        try:
+                            res = await wait_for(self.ws.get_message(), timeout=self.TIMEOUT)
+                        except ConnectionClosed:
+                            self._reconnect()
+                            raise BinanceWebsocketClosed("Connection closed. Reconnecting...")
                         res = self._handle_message(res)
                         self._log.debug(f"Received message: {res}")
                         if res:
@@ -245,9 +240,16 @@ class ReconnectingWebsocket:
                                 raise BinanceWebsocketQueueOverflow(
                                     f"Message queue size {self._queue.qsize()} exceeded maximum {self.max_queue_size}"
                                 )
+                            self._last_message_time = time.time()
                 except trio.TooSlowError:
                     self._log.debug(f"no message in {self.TIMEOUT} seconds")
-                    # _no_message_received_reconnect
+                    if self._last_message_time and (time.time() - self._last_message_time) > self.NO_MESSAGE_RECONNECT_TIMEOUT:
+                        self._reconnect()
+                        await self._queue.put({
+                            "e": "error",
+                            "type": "BinanceWebsocketClosed",
+                            "m": "No messages received; reconnecting",
+                        })
                 except trio.Cancelled as e:
                     self._log.debug(f"_read_loop cancelled error {e}")
                     await self._queue.put({
@@ -328,7 +330,7 @@ class ReconnectingWebsocket:
         if self.ws:
             self.ws = None
 
-        if self._conn and hasattr(self._conn, "protocol"):
+        if self._conn:
             await self._conn.__aexit__(None, None, None)
 
         self._reconnects += 1
