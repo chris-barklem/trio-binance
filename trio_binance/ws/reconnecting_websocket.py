@@ -102,6 +102,8 @@ class ReconnectingWebsocket:
 
         self._queue = _QueueShim()
         self._handle_read_loop = None
+        self._read_cancel_scope = None
+        self._read_task_running = False
         self._https_proxy = https_proxy
         self._ws_kwargs = kwargs
         self.max_queue_size = max_queue_size
@@ -161,23 +163,26 @@ class ReconnectingWebsocket:
         self._last_message_time = time.time()
         await self._after_connect()
         if not self._handle_read_loop:
-            # Schedule the read loop on the detected backend. Use schedule_task
-            # to pick asyncio or Trio scheduling depending on runtime.
-            try:
-                if self._loop:
-                    # use loop.call_soon_threadsafe to schedule into provided loop
-                    self._handle_read_loop = self._loop.call_soon_threadsafe(
-                        self._loop.create_task, self._read_loop()
-                    )
-                else:
-                    self._handle_read_loop = schedule_task(self._read_loop())
-            except Exception:
-                self._handle_read_loop = schedule_task(self._read_loop())
+            async def _runner():
+                self._read_task_running = True
+                with trio.CancelScope() as cs:
+                    self._read_cancel_scope = cs
+                    try:
+                        await self._read_loop()
+                    finally:
+                        self._read_task_running = False
+                        self._read_cancel_scope = None
+                        self._handle_read_loop = None
+
+            trio.lowlevel.spawn_system_task(_runner)
+            self._handle_read_loop = True
 
     async def _kill_read_loop(self):
         self.ws_state = WSListenerState.EXITING
-        while self._handle_read_loop:
-                await trio_sleep(0.1)
+        if self._read_cancel_scope:
+            self._read_cancel_scope.cancel()
+        while self._read_task_running:
+            await trio_sleep(0.1)
         self._log.debug("Finished killing read_loop")
 
     async def _before_connect(self):
