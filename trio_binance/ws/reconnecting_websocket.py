@@ -100,6 +100,9 @@ class ReconnectingWebsocket:
                 # Trio memory channels don't expose qsize; return 0 to be conservative
                 return 0
 
+            def get_recv(self):
+                return self._recv.clone()
+
         self._queue = _QueueShim()
         self._handle_read_loop = None
         self._read_cancel_scope = None
@@ -107,6 +110,7 @@ class ReconnectingWebsocket:
         self._https_proxy = https_proxy
         self._ws_kwargs = kwargs
         self.max_queue_size = max_queue_size
+        self._connected_event = trio.Event()
 
     def json_dumps(self, msg) -> str:
         if orjson:
@@ -133,34 +137,12 @@ class ReconnectingWebsocket:
             await self._exit_coro(self._path)
         if self.ws:
             await self.ws.aclose()
-        if self._conn:
-            await self._conn.__aexit__(exc_type, exc_val, exc_tb)
         self.ws = None
 
     async def connect(self):
         self._log.debug("Establishing new WebSocket connection")
         self.ws_state = WSListenerState.RECONNECTING
         await self._before_connect()
-
-        ws_url = (
-            f"{self._url}{getattr(self, '_prefix', '')}{getattr(self, '_path', '')}"
-        )
-
-        extra = self._ws_kwargs.get("extra_headers")
-        if isinstance(extra, dict):
-            self._ws_kwargs["extra_headers"] = list(extra.items())
-        # keep the async context manager open for the lifetime of the socket
-        self._conn = open_websocket_url(ws_url, **self._ws_kwargs)
-        try:
-            self.ws = await self._conn.__aenter__()
-        except Exception as e:
-            self._log.error(f"Failed to connect to websocket: {e}")
-            self.ws_state = WSListenerState.RECONNECTING
-            raise e
-        self.ws_state = WSListenerState.STREAMING
-        self._reconnects = 0
-        self._last_message_time = time.time()
-        await self._after_connect()
         if not self._handle_read_loop:
             async def _runner():
                 self._read_task_running = True
@@ -175,6 +157,11 @@ class ReconnectingWebsocket:
 
             trio.lowlevel.spawn_system_task(_runner)
             self._handle_read_loop = True
+        from trio_binance.trio_helpers import wait_for
+        try:
+            await wait_for(self._connected_event.wait(), timeout=self.MAX_RECONNECT_SECONDS)
+        except Exception:
+            raise BinanceWebsocketUnableToConnect
 
     async def _kill_read_loop(self):
         self.ws_state = WSListenerState.EXITING
@@ -216,70 +203,80 @@ class ReconnectingWebsocket:
 
     async def _read_loop(self):
         try:
+            attempts = 0
             while True:
+                if self.ws_state == WSListenerState.EXITING:
+                    break
+                ws_url = f"{self._url}{getattr(self, '_prefix', '')}{getattr(self, '_path', '')}"
+                extra = self._ws_kwargs.get("extra_headers")
+                if isinstance(extra, dict):
+                    self._ws_kwargs["extra_headers"] = list(extra.items())
                 try:
-                    while self.ws_state == WSListenerState.RECONNECTING:
-                        await self._run_reconnect()
-
+                    async with open_websocket_url(ws_url, **self._ws_kwargs) as ws:
+                        self.ws = ws
+                        self.ws_state = WSListenerState.STREAMING
+                        self._last_message_time = time.time()
+                        if not self._connected_event.is_set():
+                            self._connected_event.set()
+                        while self.ws_state == WSListenerState.STREAMING:
+                            from trio_binance.trio_helpers import wait_for
+                            try:
+                                res = await wait_for(self.ws.get_message(), timeout=self.TIMEOUT)
+                            except ConnectionClosed:
+                                await self._queue.put({
+                                    "e": "error",
+                                    "type": "BinanceWebsocketClosed",
+                                    "m": "Connection closed. Reconnecting...",
+                                })
+                                break
+                            except trio.TooSlowError:
+                                if self._last_message_time and (time.time() - self._last_message_time) > self.NO_MESSAGE_RECONNECT_TIMEOUT:
+                                    await self._queue.put({
+                                        "e": "error",
+                                        "type": "BinanceWebsocketClosed",
+                                        "m": "No messages received; reconnecting",
+                                    })
+                                    break
+                                continue
+                            res = self._handle_message(res)
+                            if res:
+                                if self._queue.qsize() < self.max_queue_size:
+                                    await self._queue.put(res)
+                                else:
+                                    raise BinanceWebsocketQueueOverflow(
+                                        f"Message queue size {self._queue.qsize()} exceeded maximum {self.max_queue_size}"
+                                    )
+                                self._last_message_time = time.time()
+                    self.ws = None
                     if self.ws_state == WSListenerState.EXITING:
-                        self._log.debug(
-                            f"_read_loop {self._path} break for {self.ws_state}"
-                        )
                         break
-                    elif self.ws_state == WSListenerState.STREAMING:
-                        assert self.ws
-                        from trio_binance.trio_helpers import wait_for
-
-                        try:
-                            res = await wait_for(self.ws.get_message(), timeout=self.TIMEOUT)
-                        except ConnectionClosed:
-                            self._reconnect()
-                            raise BinanceWebsocketClosed("Connection closed. Reconnecting...")
-                        res = self._handle_message(res)
-                        self._log.debug(f"Received message: {res}")
-                        if res:
-                            if self._queue.qsize() < self.max_queue_size:
-                                await self._queue.put(res)
-                            else:
-                                raise BinanceWebsocketQueueOverflow(
-                                    f"Message queue size {self._queue.qsize()} exceeded maximum {self.max_queue_size}"
-                                )
-                            self._last_message_time = time.time()
-                except trio.TooSlowError:
-                    self._log.debug(f"no message in {self.TIMEOUT} seconds")
-                    if self._last_message_time and (time.time() - self._last_message_time) > self.NO_MESSAGE_RECONNECT_TIMEOUT:
-                        self._reconnect()
-                        await self._queue.put({
-                            "e": "error",
-                            "type": "BinanceWebsocketClosed",
-                            "m": "No messages received; reconnecting",
-                        })
+                    self.ws_state = WSListenerState.RECONNECTING
+                    if attempts < self.MAX_RECONNECTS:
+                        reconnect_wait = self._get_reconnect_wait(attempts)
+                        attempts += 1
+                        await trio_sleep(reconnect_wait)
+                        continue
+                    else:
+                        raise BinanceWebsocketUnableToConnect
+                except (
+                    gaierror,
+                    BinanceWebsocketUnableToConnect,
+                    BinanceWebsocketQueueOverflow,
+                ) as e:
+                    await self._queue.put({
+                        "e": "error",
+                        "type": e.__class__.__name__,
+                        "m": f"{e}",
+                    })
+                    break
                 except trio.Cancelled as e:
-                    self._log.debug(f"_read_loop cancelled error {e}")
                     await self._queue.put({
                         "e": "error",
                         "type": f"{e.__class__.__name__}",
                         "m": f"{e}",
                     })
                     break
-                except (
-                    gaierror,
-                    BinanceWebsocketClosed,
-                ) as e:
-                    # reports errors and continue loop
-                    self._log.error(f"{e.__class__.__name__} ({e})")
-                    await self._queue.put({
-                        "e": "error",
-                        "type": f"{e.__class__.__name__}",
-                        "m": f"{e}",
-                    })
-                except (
-                    BinanceWebsocketUnableToConnect,
-                    BinanceWebsocketQueueOverflow,
-                    Exception,
-                ) as e:
-                    # reports errors and break the loop
-                    self._log.error(f"Unknown exception: {e.__class__.__name__} ({e})")
+                except Exception as e:
                     await self._queue.put({
                         "e": "error",
                         "type": e.__class__.__name__,
@@ -287,7 +284,7 @@ class ReconnectingWebsocket:
                     })
                     break
         finally:
-            self._handle_read_loop = None  # Signal the coro is stopped
+            self._handle_read_loop = None
             self._reconnects = 0
 
     async def _run_reconnect(self):
@@ -319,6 +316,28 @@ class ReconnectingWebsocket:
                 self._log.debug(f"no message in {self.TIMEOUT} seconds")
         return res
 
+    def get_recv(self):
+        # Ensure the socket is started so messages will flow into the channel
+        if not self._handle_read_loop:
+            async def _starter():
+                try:
+                    await self.connect()
+                except Exception as e:
+                    self._log.error(f"Socket start failed: {e}")
+
+            trio.lowlevel.spawn_system_task(_starter)
+        return self._queue.get_recv()
+
+    def start(self):
+        if not self._handle_read_loop:
+            async def _starter():
+                try:
+                    await self.connect()
+                except Exception as e:
+                    self._log.error(f"Socket start failed: {e}")
+
+            trio.lowlevel.spawn_system_task(_starter)
+
     async def _wait_for_reconnect(self):
         while (
             self.ws_state != WSListenerState.STREAMING
@@ -337,12 +356,6 @@ class ReconnectingWebsocket:
             except Exception:
                 pass
             self.ws = None
-        if self._conn:
-            try:
-                await self._conn.__aexit__(None, None, None)
-            except Exception:
-                pass
-            self._conn = None
         self._reconnects += 1
 
     def _reconnect(self):

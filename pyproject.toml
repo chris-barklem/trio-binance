@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trio-binance"
-version = "0.0.3"
+version = "0.0.4"
 description = "A Trio-native fork of python-binance: Websocket + HTTP client for Binance, migrated to Trio"
 readme = "README.md"
 requires-python = ">=3.11"
