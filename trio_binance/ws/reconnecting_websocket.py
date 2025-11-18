@@ -149,12 +149,11 @@ class ReconnectingWebsocket:
         extra = self._ws_kwargs.get("extra_headers")
         if isinstance(extra, dict):
             self._ws_kwargs["extra_headers"] = list(extra.items())
-        # trio_websocket connection
+        # keep the async context manager open for the lifetime of the socket
         self._conn = open_websocket_url(ws_url, **self._ws_kwargs)
-
         try:
             self.ws = await self._conn.__aenter__()
-        except Exception as e:  # noqa
+        except Exception as e:
             self._log.error(f"Failed to connect to websocket: {e}")
             self.ws_state = WSListenerState.RECONNECTING
             raise e
@@ -333,11 +332,17 @@ class ReconnectingWebsocket:
 
     async def before_reconnect(self):
         if self.ws:
+            try:
+                await self.ws.aclose()
+            except Exception:
+                pass
             self.ws = None
-
         if self._conn:
-            await self._conn.__aexit__(None, None, None)
-
+            try:
+                await self._conn.__aexit__(None, None, None)
+            except Exception:
+                pass
+            self._conn = None
         self._reconnects += 1
 
     def _reconnect(self):
