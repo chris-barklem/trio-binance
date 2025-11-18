@@ -97,7 +97,7 @@ If you want CI to run integration tests create a separate workflow or job with n
 
 Some environments (corporate proxies, custom certs) may cause SSL validation failures when connecting to public websockets. The integration tests currently accept disabling certificate verification in the test thread to ensure local debugging works; this is a test-only convenience and is not used in library production code.
 
-If you prefer secure default behavior, I can change the tests to make SSL verification optional via an env var (recommended for CI) and restore strict verification by default.
+If you prefer secure default behavior, change the tests to make SSL verification optional via an env var (recommended for CI) and restore strict verification by default.
 
 
 ## Development & Contributing
@@ -118,4 +118,3 @@ If you prefer secure default behavior, I can change the tests to make SSL verifi
 
 This project forks work from `sammchardy/python-binance` and preserves the original license and credits. See the upstream repository for full attribution.
 
----
