@@ -85,31 +85,34 @@ class ReconnectingWebsocket:
         # asyncio.Queue (current behavior) or trio memory channels after
         # migration. The shim exposes async put(), get(), and qsize().
         class _QueueShim:
-            def __init__(self):
+            def __init__(self, max_buf: int):
                 from trio_binance.trio_helpers import open_memory_channel
 
-                self._send, self._recv = open_memory_channel(0)
+                self._send, self._recv = open_memory_channel(max_buf)
 
             async def put(self, item):
-                await self._send.send(item)
+                import trio
+                try:
+                    self._send.send_nowait(item)
+                except trio.WouldBlock:
+                    raise BinanceWebsocketQueueOverflow
 
             async def get(self):
                 return await self._recv.receive()
 
             def qsize(self):
-                # Trio memory channels don't expose qsize; return 0 to be conservative
-                return 0
+                return self._send.statistics().current_buffer_size
 
             def get_recv(self):
                 return self._recv.clone()
 
-        self._queue = _QueueShim()
+        self.max_queue_size = max_queue_size
+        self._queue = _QueueShim(self.max_queue_size)
         self._handle_read_loop = None
         self._read_cancel_scope = None
         self._read_task_running = False
         self._https_proxy = https_proxy
         self._ws_kwargs = kwargs
-        self.max_queue_size = max_queue_size
         self._connected_event = trio.Event()
 
     def json_dumps(self, msg) -> str:
@@ -240,13 +243,12 @@ class ReconnectingWebsocket:
                                 continue
                             res = self._handle_message(res)
                             if res:
-                                if self._queue.qsize() < self.max_queue_size:
+                                try:
                                     await self._queue.put(res)
+                                except BinanceWebsocketQueueOverflow:
+                                    pass
                                 else:
-                                    raise BinanceWebsocketQueueOverflow(
-                                        f"Message queue size {self._queue.qsize()} exceeded maximum {self.max_queue_size}"
-                                    )
-                                self._last_message_time = time.time()
+                                    self._last_message_time = time.time()
                     self.ws = None
                     if self.ws_state == WSListenerState.EXITING:
                         break
@@ -268,7 +270,18 @@ class ReconnectingWebsocket:
                         "type": e.__class__.__name__,
                         "m": f"{e}",
                     })
-                    break
+                    # keep reader alive: backoff and retry
+                    self.ws = None
+                    self.ws_state = WSListenerState.RECONNECTING
+                    if attempts < self.MAX_RECONNECTS:
+                        reconnect_wait = self._get_reconnect_wait(attempts)
+                        attempts += 1
+                        await trio_sleep(reconnect_wait)
+                        continue
+                    else:
+                        attempts = 0
+                        await trio_sleep(self.MIN_RECONNECT_WAIT)
+                        continue
                 except trio.Cancelled as e:
                     await self._queue.put({
                         "e": "error",
@@ -282,7 +295,12 @@ class ReconnectingWebsocket:
                         "type": e.__class__.__name__,
                         "m": f"{e}",
                     })
-                    break
+                    # keep reader alive: backoff and retry
+                    self.ws = None
+                    self.ws_state = WSListenerState.RECONNECTING
+                    attempts = 0
+                    await trio_sleep(self.MIN_RECONNECT_WAIT)
+                    continue
         finally:
             self._handle_read_loop = None
             self._reconnects = 0
