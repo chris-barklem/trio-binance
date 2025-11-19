@@ -54,6 +54,7 @@ class ReconnectingWebsocket:
     MIN_RECONNECT_WAIT = 0.1
     TIMEOUT = 10
     NO_MESSAGE_RECONNECT_TIMEOUT = 60
+    NO_PING_RECONNECT_TIMEOUT = None
 
     def __init__(
         self,
@@ -233,13 +234,20 @@ class ReconnectingWebsocket:
                                 })
                                 break
                             except trio.TooSlowError:
-                                if self._last_message_time and (time.time() - self._last_message_time) > self.NO_MESSAGE_RECONNECT_TIMEOUT:
-                                    await self._queue.put({
-                                        "e": "error",
-                                        "type": "BinanceWebsocketClosed",
-                                        "m": "No messages received; reconnecting",
-                                    })
-                                    break
+                                now = time.time()
+                                if self._last_message_time:
+                                    if (
+                                        self.NO_PING_RECONNECT_TIMEOUT
+                                        and (now - self._last_message_time) > self.NO_PING_RECONNECT_TIMEOUT
+                                    ) or (
+                                        (now - self._last_message_time) > self.NO_MESSAGE_RECONNECT_TIMEOUT
+                                    ):
+                                        await self._queue.put({
+                                            "e": "error",
+                                            "type": "BinanceWebsocketClosed",
+                                            "m": "Inactivity threshold reached; reconnecting",
+                                        })
+                                        break
                                 continue
                             res = self._handle_message(res)
                             if res:
